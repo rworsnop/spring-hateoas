@@ -15,10 +15,8 @@
  */
 package org.springframework.hateoas.client;
 
-import com.jayway.jsonpath.JsonPath;
 import lombok.RequiredArgsConstructor;
 import lombok.Value;
-import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.core.io.support.SpringFactoriesLoader;
 import org.springframework.hateoas.Link;
 import org.springframework.hateoas.UriTemplate;
@@ -27,10 +25,10 @@ import org.springframework.hateoas.mediatype.hal.HalLinkDiscoverer;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
-import org.springframework.http.converter.HttpMessageConverter;
 import org.springframework.lang.Nullable;
 import org.springframework.plugin.core.PluginRegistry;
 import org.springframework.util.Assert;
+import org.springframework.web.reactive.function.client.ClientResponse;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
 
@@ -101,16 +99,6 @@ public class ReactiveTraverson {
         this.webClient = webClient;
 
         setLinkDiscoverers(DEFAULTS.getLinkDiscoverers(mediaTypes));
-    }
-
-    /**
-     * Returns all {@link HttpMessageConverter}s that will be registered for the given {@link MediaType}s by default.
-     *
-     * @param mediaTypes must not be {@literal null}.
-     * @return
-     */
-    public static List<HttpMessageConverter<?>> getDefaultMessageConverters(MediaType... mediaTypes) {
-        return DEFAULTS.getHttpMessageConverters(Arrays.asList(mediaTypes));
     }
 
     /**
@@ -244,82 +232,13 @@ public class ReactiveTraverson {
             return this;
         }
 
-        /**
-         * Executes the traversal and marshals the final response into an object of the given type.
-         *
-         * @param type must not be {@literal null}.
-         * @return
-         */
-        @Nullable
-        public <T> Mono<T> toObject(Class<T> type) {
-
-            Assert.notNull(type, "Target type must not be null!");
-
-            return traverseToExpandedFinalUrl()
-                .flatMap(uriAndHeaders -> webClient.get()
-                    .uri(uriAndHeaders.getUri())
-                    .headers(hdrs -> hdrs.addAll(prepareRequest(mergeHeaders(this.headers, uriAndHeaders.getHttpHeaders()))))
-                    .retrieve()
-                    .bodyToMono(type));
+        public Mono<ClientResponse> exchange() {
+            return toRequestHeadersSpec().flatMap(WebClient.RequestHeadersSpec::exchange);
         }
 
-        /**
-         * Executes the traversal and marshals the final response into an object of the given
-         * {@link ParameterizedTypeReference}.
-         *
-         * @param type must not be {@literal null}.
-         * @return
-         */
-        @Nullable
-        public <T> Mono<T> toObject(ParameterizedTypeReference<T> type) {
-
-            Assert.notNull(type, "Target type must not be null!");
-
-            return traverseToExpandedFinalUrl()
-                .flatMap(uriAndHeaders -> webClient.get()
-                    .uri(uriAndHeaders.getUri())
-                    .headers(hdrs -> hdrs.addAll(prepareRequest(mergeHeaders(this.headers, uriAndHeaders.getHttpHeaders()))))
-                    .retrieve()
-                    .bodyToMono(type));
+        public Mono<WebClient.ResponseSpec> retrieve() {
+            return toRequestHeadersSpec().map(WebClient.RequestHeadersSpec::retrieve);
         }
-
-        /**
-         * Executes the traversal and returns the result of the given JSON Path expression evaluated against the final
-         * representation.
-         *
-         * @param jsonPath must not be {@literal null} or empty.
-         * @return
-         */
-        public <T> Mono<T> toObject(String jsonPath) {
-
-            Assert.hasText(jsonPath, "JSON path must not be null or empty!");
-
-            return traverseToExpandedFinalUrl()
-                .flatMap(uriAndHeaders -> webClient.get()
-                    .uri(uriAndHeaders.getUri())
-                    .headers(hdrs -> hdrs.addAll(prepareRequest(mergeHeaders(this.headers, uriAndHeaders.getHttpHeaders()))))
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .map(forObject -> JsonPath.read(forObject, jsonPath)));
-        }
-
-        /**
-         * Returns the raw {@link ResponseEntity} with the representation unmarshalled into an instance of the given type.
-         *
-         * @param type must not be {@literal null}.
-         * @return
-         */
-        public <T> Mono<ResponseEntity<T>> toEntity(Class<T> type) {
-
-            Assert.notNull(type, "Target type must not be null!");
-
-            return traverseToExpandedFinalUrl()
-                .flatMap(uriAndHeaders -> webClient.get()
-                    .uri(uriAndHeaders.getUri())
-                    .headers(hdrs -> hdrs.addAll(prepareRequest(mergeHeaders(this.headers, uriAndHeaders.getHttpHeaders()))))
-                    .retrieve()
-                    .toEntity(type));
-         }
 
         /**
          * Returns the {@link Link} found for the last rel in the rels configured to follow. Will expand the final
@@ -341,6 +260,13 @@ public class ReactiveTraverson {
          */
         public Mono<Link> asTemplatedLink() {
             return traverseToLink(false);
+        }
+
+        private Mono<WebClient.RequestHeadersSpec<?>> toRequestHeadersSpec() {
+            return traverseToExpandedFinalUrl()
+                .map(uriAndHeaders -> webClient.get()
+                    .uri(uriAndHeaders.getUri())
+                    .headers(hdrs -> hdrs.addAll(prepareRequest(mergeHeaders(this.headers, uriAndHeaders.getHttpHeaders())))));
         }
 
         private Mono<Link> traverseToLink(boolean expandFinalUrl) {

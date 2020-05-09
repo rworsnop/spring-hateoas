@@ -15,19 +15,9 @@
  */
 package org.springframework.hateoas.client;
 
-import static net.jadler.Jadler.*;
-import static org.assertj.core.api.Assertions.*;
-import static org.hamcrest.Matchers.*;
-import static org.springframework.hateoas.client.Hop.*;
-
-import java.io.IOException;
-import java.net.URI;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.jayway.jsonpath.JsonPath;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -37,18 +27,40 @@ import org.springframework.hateoas.EntityModel;
 import org.springframework.hateoas.Link;
 import org.springframework.hateoas.MediaTypes;
 import org.springframework.hateoas.client.Traverson.TraversalBuilder;
+import org.springframework.hateoas.mediatype.hal.Jackson2HalModule;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpRequest;
 import org.springframework.http.MediaType;
 import org.springframework.http.client.ClientHttpRequestExecution;
 import org.springframework.http.client.ClientHttpRequestInterceptor;
 import org.springframework.http.client.ClientHttpResponse;
+import org.springframework.http.codec.ClientCodecConfigurer;
+import org.springframework.http.codec.json.Jackson2JsonDecoder;
+import org.springframework.http.codec.json.Jackson2JsonEncoder;
 import org.springframework.http.converter.HttpMessageConverter;
 import org.springframework.http.converter.StringHttpMessageConverter;
 import org.springframework.http.converter.json.MappingJackson2HttpMessageConverter;
-import org.springframework.test.context.event.annotation.AfterTestClass;
-import org.springframework.test.context.event.annotation.BeforeTestClass;
+import org.springframework.util.MimeType;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.test.StepVerifier;
+
+import java.io.IOException;
+import java.net.URI;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Consumer;
+
+import static net.jadler.Jadler.verifyThatRequest;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
+import static org.hamcrest.Matchers.contains;
+import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.startsWith;
+import static org.springframework.hateoas.client.Hop.rel;
 
 /**
  * Integration tests for {@link Traverson}.
@@ -58,11 +70,12 @@ import org.springframework.web.client.RestTemplate;
  * @author Michael Wirth
  * @since 0.11
  */
-class TraversonTest {
+class ReactiveTraversonTest {
 
 	static URI baseUri;
 	static Server server;
 
+	ReactiveTraverson reactiveTraverson;
 	Traverson traverson;
 
 	@BeforeAll
@@ -76,6 +89,7 @@ class TraversonTest {
 
 	@BeforeEach
 	void setUp() {
+		this.reactiveTraverson = new ReactiveTraverson(WebClient.create(), baseUri, MediaTypes.HAL_JSON);
 		this.traverson = new Traverson(baseUri, MediaTypes.HAL_JSON);
 
 	}
@@ -95,7 +109,7 @@ class TraversonTest {
 	void rejectsNullBaseUri() {
 
 		assertThatIllegalArgumentException().isThrownBy(() -> {
-			new Traverson(null, MediaTypes.HAL_JSON);
+			new ReactiveTraverson(WebClient.create(), null, MediaTypes.HAL_JSON);
 		});
 	}
 
@@ -106,7 +120,7 @@ class TraversonTest {
 	void rejectsEmptyMediaTypes() {
 
 		assertThatIllegalArgumentException().isThrownBy(() -> {
-			new Traverson(baseUri);
+			new ReactiveTraverson(WebClient.create(), baseUri);
 		});
 	}
 
@@ -115,12 +129,15 @@ class TraversonTest {
 	 */
 	@Test
 	void sendsConfiguredMediaTypesInAcceptHeader() {
+		StepVerifier.create(reactiveTraverson.follow()
+			.retrieve()
+			.flatMap(spec -> spec.bodyToMono(String.class)))
+			.expectNextCount(1)
+			.verifyComplete();
 
-		traverson.follow().toObject(String.class);
-
-		verifyThatRequest() //
-				.havingPathEqualTo("/") //
-				.havingHeader("Accept", contains(MediaTypes.HAL_JSON_VALUE)) //
+		verifyThatRequest()
+				.havingPathEqualTo("/")
+				.havingHeader("Accept", contains(MediaTypes.HAL_JSON_VALUE))
 				.receivedOnce();
 	}
 
@@ -129,7 +146,12 @@ class TraversonTest {
 	 */
 	@Test
 	void readsTraversalIntoJsonPathExpression() {
-		assertThat(traverson.follow("movies", "movie", "actor").<String> toObject("$.name")).isEqualTo("Keanu Reaves");
+		StepVerifier.create(reactiveTraverson.follow("movies", "movie", "actor")
+				.retrieve()
+				.flatMap(spec -> spec.bodyToMono(String.class))
+				.map(body -> JsonPath.read(body, "$.name")))
+			.expectNext("Keanu Reaves")
+			.verifyComplete();
 	}
 
 	/**
@@ -137,12 +159,15 @@ class TraversonTest {
 	 */
 	@Test
 	void readsJsonPathTraversalIntoJsonPathExpression() {
-
-		assertThat(traverson.follow(//
+		StepVerifier.create(reactiveTraverson.follow(
 				"$._links.movies.href", //
 				"$._links.movie.href", //
-				"$._links.actor.href").<String> toObject("$.name")) //
-						.isEqualTo("Keanu Reaves");
+				"$._links.actor.href")
+			.retrieve()
+			.flatMap(spec -> spec.bodyToMono(String.class))
+			.map(body -> JsonPath.read(body, "$.name")))
+			.expectNext("Keanu Reaves")
+			.verifyComplete();
 	}
 
 	/**
@@ -152,9 +177,13 @@ class TraversonTest {
 	void readsTraversalIntoResourceInstance() {
 
 		ParameterizedTypeReference<EntityModel<Actor>> typeReference = new ParameterizedTypeReference<EntityModel<Actor>>() {};
-		EntityModel<Actor> result = traverson.follow("movies", "movie", "actor").toObject(typeReference);
-
-		assertThat(result.getContent().name).isEqualTo("Keanu Reaves");
+		StepVerifier.create(reactiveTraverson.follow("movies", "movie", "actor")
+			.retrieve()
+			.flatMap(spec -> spec.bodyToMono(typeReference))
+			.map(EntityModel::getContent)
+			.map(Actor::getName))
+			.expectNext("Keanu Reaves")
+			.verifyComplete();
 	}
 
 	/**
@@ -168,8 +197,13 @@ class TraversonTest {
 		HttpHeaders headers = new HttpHeaders();
 		headers.add("Link", expectedHeader);
 
-		assertThat(traverson.follow("movies", "movie", "actor") //
-				.withHeaders(headers).<String> toObject("$.name")).isEqualTo("Keanu Reaves");
+		StepVerifier.create(reactiveTraverson.follow("movies", "movie", "actor")
+			.withHeaders(headers)
+			.retrieve()
+			.flatMap(spec -> spec.bodyToMono(String.class))
+			.map(body -> JsonPath.read(body, "$.name")))
+			.expectNext("Keanu Reaves")
+			.verifyComplete();
 
 		verifyThatRequest() //
 				.havingPath(startsWith("/actors/")) //
@@ -188,30 +222,17 @@ class TraversonTest {
 		HttpHeaders headers = new HttpHeaders();
 		headers.add("Link", expectedHeader);
 
-		traverson.follow("movies", "movie", "actor").//
-				withHeaders(headers).toEntity(Actor.class);
+		StepVerifier.create(reactiveTraverson.follow("movies", "movie", "actor")
+			.withHeaders(headers)
+			.retrieve()
+			.flatMap(spec -> spec.toEntity(Actor.class)))
+			.expectNextCount(1)
+			.verifyComplete();
 
-		verifyThatRequest(). //
-				havingPathEqualTo("/actors/d95dbf62-f900-4dfa-9de8-0fc71e02ffa4"). //
-				havingHeader("Link", hasItem(expectedHeader));
-	}
-
-	/**
-	 * @see #201, #203
-	 */
-	@Test
-	void allowsCustomizingRestTemplate() {
-
-		CountingInterceptor interceptor = new CountingInterceptor();
-
-		RestTemplate restTemplate = new RestTemplate();
-		restTemplate.setInterceptors(Arrays.asList(interceptor));
-
-		this.traverson = new Traverson(baseUri, MediaTypes.HAL_JSON);
-		this.traverson.setRestOperations(restTemplate);
-
-		traverson.follow("movies", "movie", "actor").<String> toObject("$.name");
-		assertThat(interceptor.intercepted).isEqualTo(4);
+		verifyThatRequest() //
+				.havingPath(startsWith("/actors/")) //
+				.havingHeader("Link", hasItem(expectedHeader))
+				.receivedOnce();
 	}
 
 	/**
@@ -220,11 +241,16 @@ class TraversonTest {
 	@Test
 	void usesCustomLinkDiscoverer() {
 
-		this.traverson = new Traverson(URI.create(server.rootResource() + "/github"), MediaType.APPLICATION_JSON);
-		this.traverson.setLinkDiscoverers(Arrays.asList(new GitHubLinkDiscoverer()));
+		this.reactiveTraverson = new ReactiveTraverson(
+			WebClient.create(), URI.create(server.rootResource() + "/github"), MediaType.APPLICATION_JSON);
+		this.reactiveTraverson.setLinkDiscoverers(Arrays.asList(new GitHubLinkDiscoverer()));
 
-		String value = this.traverson.follow("foo").toObject("$.key");
-		assertThat(value).isEqualTo("value");
+		StepVerifier.create(this.reactiveTraverson.follow("foo")
+				.retrieve()
+				.flatMap(spec -> spec.bodyToMono(String.class)
+				.map(body -> JsonPath.read(body, "$.key"))))
+			.expectNext("value")
+			.verifyComplete();
 	}
 
 	/**
@@ -233,10 +259,13 @@ class TraversonTest {
 	@Test
 	void shouldReturnLastLinkFound() {
 
-		Link result = traverson.follow("movies").asLink();
-
-		assertThat(result.getHref()).endsWith("/movies");
-		assertThat(result.hasRel("movies")).isTrue();
+		StepVerifier.create(reactiveTraverson.follow("movies")
+			.asLink())
+			.assertNext(link -> {
+				assertThat(link.getHref()).endsWith("/movies");
+				assertThat(link.hasRel("movies")).isTrue();
+			})
+			.verifyComplete();
 	}
 
 	/**
@@ -245,64 +274,39 @@ class TraversonTest {
 	@Test
 	void returnsTemplatedLinkIfRequested() {
 
-		TraversalBuilder follow = new Traverson(URI.create(server.rootResource().concat("/link")), MediaTypes.HAL_JSON)
+		ReactiveTraverson.TraversalBuilder follow = new ReactiveTraverson(
+			WebClient.create(), URI.create(server.rootResource().concat("/link")), MediaTypes.HAL_JSON)
 				.follow("self");
 
-		Link link = follow.asTemplatedLink();
+		StepVerifier.create(follow.asTemplatedLink())
+			.assertNext(link -> {
+				assertThat(link.isTemplated()).isTrue();
+				assertThat(link.getVariableNames()).contains("template");
+			})
+			.verifyComplete();
 
-		assertThat(link.isTemplated()).isTrue();
-		assertThat(link.getVariableNames()).contains("template");
-
-		link = follow.asLink();
-
-		assertThat(link.isTemplated()).isFalse();
+		StepVerifier.create(follow.asLink())
+			.assertNext(link -> assertThat(link.isTemplated()).isFalse())
+			.verifyComplete();
 	}
 
 	@Test // #971
 	void returnsTemplatedRequiredLinkIfRequested() {
 
-		Link templatedLink = new Traverson(URI.create(server.rootResource() + "/github-with-template"), MediaTypes.HAL_JSON) //
+		StepVerifier.create(new ReactiveTraverson(
+			WebClient.create(), URI.create(server.rootResource() + "/github-with-template"), MediaTypes.HAL_JSON) //
 				.follow("rel_to_templated_link") //
-				.asTemplatedLink();
+				.asTemplatedLink())
+			.assertNext(templatedLink -> {
+				assertThat(templatedLink.isTemplated()).isTrue();
+				assertThat(templatedLink.getVariableNames()).contains("issue");
 
-		assertThat(templatedLink.isTemplated()).isTrue();
-		assertThat(templatedLink.getVariableNames()).contains("issue");
+				Link expandedLink = templatedLink.expand("42");
 
-		Link expandedLink = templatedLink.expand("42");
-
-		assertThat(expandedLink.isTemplated()).isFalse();
-		assertThat(expandedLink.getHref()).isEqualTo("/github/42");
-	}
-
-	/**
-	 * @see #258
-	 */
-	@Test
-	void returnsDefaultMessageConvertersForHal() {
-
-		List<HttpMessageConverter<?>> converters = Traverson.getDefaultMessageConverters(MediaTypes.HAL_JSON);
-
-		assertThat(converters).hasSize(2);
-		assertThat(converters.get(0)).isInstanceOf(StringHttpMessageConverter.class);
-		assertThat(converters.get(1)).isInstanceOf(MappingJackson2HttpMessageConverter.class);
-
-		converters = Traverson.getDefaultMessageConverters(MediaTypes.HAL_JSON);
-
-		assertThat(converters).hasSize(2);
-		assertThat(converters.get(0)).isInstanceOf(StringHttpMessageConverter.class);
-		assertThat(converters.get(1)).isInstanceOf(MappingJackson2HttpMessageConverter.class);
-	}
-
-	/**
-	 * @see #258
-	 */
-	@Test
-	void returnsDefaultMessageConverters() {
-
-		List<HttpMessageConverter<?>> converters = Traverson.getDefaultMessageConverters();
-
-		assertThat(converters).hasSize(1);
-		assertThat(converters.get(0)).isInstanceOf(StringHttpMessageConverter.class);
+				assertThat(expandedLink.isTemplated()).isFalse();
+				assertThat(expandedLink.getHref()).isEqualTo("/github/42");
+			})
+		.verifyComplete();
 	}
 
 	/**
@@ -312,9 +316,13 @@ class TraversonTest {
 	void chainMultipleFollowOperations() {
 
 		ParameterizedTypeReference<EntityModel<Actor>> typeReference = new ParameterizedTypeReference<EntityModel<Actor>>() {};
-		EntityModel<Actor> result = traverson.follow("movies").follow("movie").follow("actor").toObject(typeReference);
-
-		assertThat(result.getContent().name).isEqualTo("Keanu Reaves");
+		StepVerifier.create(reactiveTraverson.follow("movies").follow("movie").follow("actor")
+				.retrieve()
+				.flatMap(spec -> spec.bodyToMono(typeReference))
+				.map(EntityModel::getContent)
+				.map(Actor::getName))
+			.expectNext("Keanu Reaves")
+			.verifyComplete();
 	}
 
 	/**
@@ -322,25 +330,38 @@ class TraversonTest {
 	 */
 	@Test
 	void allowAlteringTheDetailsOfASingleHop() {
+		MimeType mimeType = MimeType.valueOf("application/hal+json");
+		ObjectMapper mapper = new ObjectMapper();
+		mapper.registerModule(new Jackson2HalModule());
+		mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
-		this.traverson = new Traverson(URI.create(server.rootResource() + "/springagram"), MediaTypes.HAL_JSON);
+		WebClient webClient = WebClient.builder()
+			.codecs(configurer -> {
+				configurer.customCodecs().registerWithDefaultConfig(new Jackson2JsonEncoder(mapper, mimeType));
+				configurer.customCodecs().registerWithDefaultConfig(new Jackson2JsonDecoder(mapper, mimeType));
+			}).build();
+
+		this.reactiveTraverson = new ReactiveTraverson(
+				webClient, URI.create(server.rootResource() + "/springagram"), MediaTypes.HAL_JSON);
 
 		// tag::hop-with-param[]
 		ParameterizedTypeReference<EntityModel<Item>> resourceParameterizedTypeReference = new ParameterizedTypeReference<EntityModel<Item>>() {};
 
-		EntityModel<Item> itemResource = traverson.//
-				follow(rel("items").withParameter("projection", "noImages")).//
-				follow("$._embedded.items[0]._links.self.href").//
-				toObject(resourceParameterizedTypeReference);
-		// end::hop-with-param[]
+		StepVerifier.create(reactiveTraverson
+			.follow(rel("items").withParameter("projection", "noImages"))
+			.follow("$._embedded.items[0]._links.self.href")
+			.retrieve()
+			.flatMap(spec -> spec.bodyToMono(resourceParameterizedTypeReference)))
+			.assertNext(itemResource -> {
+				assertThat(itemResource.hasLink("self")).isTrue();
+				assertThat(itemResource.getRequiredLink("self").expand().getHref())
+					.isEqualTo(server.rootResource() + "/springagram/items/1");
 
-		assertThat(itemResource.hasLink("self")).isTrue();
-		assertThat(itemResource.getRequiredLink("self").expand().getHref())
-				.isEqualTo(server.rootResource() + "/springagram/items/1");
-
-		final Item item = itemResource.getContent();
-		assertThat(item.image).isEqualTo(server.rootResource() + "/springagram/file/cat");
-		assertThat(item.description).isEqualTo("cat");
+				final Item item = itemResource.getContent();
+				assertThat(item.image).isEqualTo(server.rootResource() + "/springagram/file/cat");
+				assertThat(item.description).isEqualTo("cat");
+			})
+			.verifyComplete();
 	}
 
 	/**
@@ -349,7 +370,7 @@ class TraversonTest {
 	@Test
 	void allowAlteringTheDetailsOfASingleHopByMapOperations() {
 
-		this.traverson = new Traverson(URI.create(server.rootResource() + "/springagram"), MediaTypes.HAL_JSON);
+		this.reactiveTraverson = new ReactiveTraverson(WebClient.create(), URI.create(server.rootResource() + "/springagram"), MediaTypes.HAL_JSON);
 
 		// tag::hop-put[]
 		ParameterizedTypeReference<EntityModel<Item>> resourceParameterizedTypeReference = new ParameterizedTypeReference<EntityModel<Item>>() {};
